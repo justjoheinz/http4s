@@ -1,7 +1,6 @@
 package org.http4s
 package servlet
 
-import java.util.concurrent.atomic.AtomicReference
 
 import scodec.bits.ByteVector
 import server._
@@ -9,11 +8,9 @@ import server._
 import javax.servlet.http.{HttpServletResponse, HttpServletRequest, HttpServlet}
 import java.net.InetAddress
 
-import scala.annotation.tailrec
 import scala.collection.JavaConverters._
-import javax.servlet.{ ReadListener, ServletConfig, AsyncContext }
+import javax.servlet._
 
-import scala.concurrent.ExecutionContext
 import scala.concurrent.duration.Duration
 import scalaz.concurrent.{Actor, Task}
 import scalaz.stream.Cause.{End, Terminated}
@@ -34,6 +31,7 @@ class Http4sServlet(service: HttpService,
 
   private[this] var serverSoftware: ServerSoftware = _
   private[this] var inputStreamReader: BodyReader = _
+  private[this] var outputStreamWriter: BodyWriter = _
 
   override def init(config: ServletConfig) {
     val servletContext = config.getServletContext
@@ -41,10 +39,20 @@ class Http4sServlet(service: HttpService,
     val servletApiVersion = ServletApiVersion(servletContext)
     logger.info(s"Detected Servlet API version ${servletApiVersion}")
 
-    inputStreamReader = if (servletApiVersion >= ServletApiVersion(3, 1))
-      asyncInputStreamReader(chunkSize)
-    else
-      syncInputStreamReader(chunkSize)
+    if (servletApiVersion >= ServletApiVersion(3, 1)) {
+      inputStreamReader = asyncInputStreamReader(chunkSize)
+      outputStreamWriter = asyncOutputStreamWriter
+    } else {
+      inputStreamReader = syncInputStreamReader(chunkSize)
+      outputStreamWriter = { (resp: HttpServletResponse, body: EntityBody) =>
+        val out = resp.getOutputStream
+        body.map { chunk =>
+          out.write(chunk.toArray)
+          //if (isChunked) servletResponse.flushBuffer()
+        }.run
+      }
+    }
+
   }
 
 
@@ -138,6 +146,62 @@ object Http4sServlet extends LazyLogging {
   private[servlet] val DefaultChunkSize = Http4sConfig.getInt("org.http4s.servlet.default-chunk-size")
 
   private type BodyReader = HttpServletRequest => EntityBody
+  private type BodyWriter = (HttpServletResponse, EntityBody) => Task[Unit]
+
+  private def asyncOutputStreamWriter(resp: HttpServletResponse, body: EntityBody): Task[Unit] = {
+    type Callback = Throwable \/ Unit => Unit
+    case class BytePacket(v: ByteVector, cb: Callback)
+    case object WriteReady
+
+    val out = resp.getOutputStream
+    var wait: BytePacket = null
+    var error: Throwable = null
+
+    if (body eq Process.halt) Task.now(())
+    else {
+      val actor: Actor[Any] = Actor.actor[Any] {
+        case c @ BytePacket(_, callback: Callback) if error != null =>
+          callback(-\/(error))
+
+        case c @ BytePacket(vector: ByteVector, callback: Callback) =>
+          if (vector.length > 0) {
+            if (out.isReady) out.write(vector.toArray)
+            else wait = c
+          } else callback(\/-(()))
+
+        case WriteReady =>
+          wait match {
+            case BytePacket(bv, cb) =>
+              out.write(bv.toArray)
+              cb(\/-(()))
+              wait = null
+
+            case null => // noop
+          }
+
+        case t: Throwable =>
+          logger.error("Error during Servlet Async Write", t)
+          error = t
+          wait match {
+            case BytePacket(_, cb) =>
+              cb(-\/(t))
+              wait = null
+
+            case null => // noop
+          }
+      }
+
+      // Initialized the listener
+      out.setWriteListener(new WriteListener {
+        override def onWritePossible(): Unit = actor ! WriteReady
+        override def onError(t: Throwable): Unit = actor ! t
+      })
+
+      body.to(Process.constant{ bv: ByteVector =>
+        Task.async[Unit] ( cb => actor ! (bv, cb) )
+      }).run
+    }
+  }
 
   private def asyncInputStreamReader(chunkSize: Int)(req: HttpServletRequest): EntityBody = {
     type Callback = Throwable \/ ByteVector => Unit
