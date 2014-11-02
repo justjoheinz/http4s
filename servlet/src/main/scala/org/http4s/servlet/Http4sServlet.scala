@@ -145,63 +145,51 @@ object Http4sServlet extends LazyLogging {
   private type BodyWriter = (HttpServletResponse, EntityBody) => Task[Unit]
 
   private def asyncOutputStreamWriter(resp: HttpServletResponse, body: EntityBody): Task[Unit] = {
-    type Callback = Throwable \/ Unit => Unit
-
-    sealed trait Msg
-    case class BytePacket(v: ByteVector, cb: Callback) extends Msg
-    case class Err(t: Throwable) extends Msg
-    case object WriteReady extends Msg
+    type Callback = Throwable \/ (ByteVector => Task[Unit]) => Unit
+    case object WriteReady
 
     val out = resp.getOutputStream
-    var wait: BytePacket = null
-    var error: Throwable = null
+    var blocked: Option[Callback] = None
+    var error: Option[Throwable] = None
+
+    val write = { chunk: ByteVector =>
+      Task.now { out.write(chunk.toArray) }
+    }
 
     if (body eq Process.halt) Task.now(())
     else {
-      val actor: Actor[Msg] = Actor.actor[Msg] {
-        case c @ BytePacket(vector: ByteVector, callback: Callback) =>
-          if (error != null) callback(-\/(error))
-          else if (vector.length > 0) {
-            logger.debug("Writing packet.")
-            if (out.isReady) {
-              out.write(vector.toArray)
-              callback(\/-(()))
-            }
-            else wait = c
-          } else callback(\/-(()))
+      val actor: Actor[Any] = Actor.actor[Any] {
+        case callback: Callback =>
+          if (error.isDefined)
+            callback(-\/(error.get))
+          else if (out.isReady)
+            callback(\/-(write))
+          else
+            blocked = Some(callback)
 
         case WriteReady =>
           logger.debug("Write ready")
-          if (out.isReady) wait match {
-            case BytePacket(bv, cb) =>
-              out.write(bv.toArray)
-              cb(\/-(()))
-              wait = null
+          blocked.foreach { _(\/-(write)) }
+          blocked = None
 
-            case null => // noop
-          }
-
-        case Err(t) =>
+        case t: Throwable =>
           logger.error("Error during Servlet Async Write", t)
-          error = t
-          wait match {
-            case BytePacket(_, cb) =>
-              cb(-\/(t))
-              wait = null
-
-            case null => // noop
-          }
+          error = Some(t)
+          blocked.foreach { _(-\/(t)) }
+          blocked = None
       }
 
       // Initialized the listener
       out.setWriteListener(new WriteListener {
         override def onWritePossible(): Unit = actor ! WriteReady
-        override def onError(t: Throwable): Unit = actor ! Err(t)
+        override def onError(t: Throwable): Unit = actor ! t
       })
 
-      body.to(Process.emit { bv: ByteVector =>
-        Task.async[Unit] { cb => actor ! BytePacket(bv, cb) }
-      }.repeat).run
+      val sink = Process.repeatEval {
+        Task.async[ByteVector => Task[Unit]] { actor ! _ }
+      }
+
+      body.to(sink).run
     }
   }
 
