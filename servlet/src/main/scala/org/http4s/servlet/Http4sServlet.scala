@@ -2,6 +2,8 @@ package org.http4s
 package servlet
 
 
+import java.util.concurrent.atomic.AtomicReference
+
 import scodec.bits.ByteVector
 import server._
 
@@ -44,11 +46,11 @@ class Http4sServlet(service: HttpService,
       outputStreamWriter = asyncOutputStreamWriter
     } else {
       inputStreamReader = syncInputStreamReader(chunkSize)
-      outputStreamWriter = { (resp: HttpServletResponse, body: EntityBody) =>
+      outputStreamWriter = { (resp: HttpServletResponse, body: EntityBody, isChunked: Boolean) =>
         val out = resp.getOutputStream
         body.map { chunk =>
           out.write(chunk.toArray)
-          //if (isChunked) servletResponse.flushBuffer()
+          if (isChunked) out.flush()
         }.run
       }
     }
@@ -95,7 +97,7 @@ class Http4sServlet(service: HttpService,
           for (header <- response.headers)
             servletResponse.addHeader(header.name.toString, header.value)
 
-          outputStreamWriter(servletResponse, response.body)
+          outputStreamWriter(servletResponse, response.body, response.isChunked)
 
         case None => ResponseBuilder.notFound(request)
       }
@@ -142,51 +144,58 @@ object Http4sServlet extends LazyLogging {
   private[servlet] val DefaultChunkSize = Http4sConfig.getInt("org.http4s.servlet.default-chunk-size")
 
   private type BodyReader = HttpServletRequest => EntityBody
-  private type BodyWriter = (HttpServletResponse, EntityBody) => Task[Unit]
+  private type BodyWriter = (HttpServletResponse, EntityBody, Boolean) => Task[Unit]
 
-  private def asyncOutputStreamWriter(resp: HttpServletResponse, body: EntityBody): Task[Unit] = {
+  private def asyncOutputStreamWriter(resp: HttpServletResponse, body: EntityBody, flush: Boolean): Task[Unit] = {
     type Callback = Throwable \/ (ByteVector => Task[Unit]) => Unit
-    case object WriteReady
-
     val out = resp.getOutputStream
-    var blocked: Option[Callback] = None
-    var error: Option[Throwable] = None
 
-    val write = { chunk: ByteVector =>
-      Task.now { out.write(chunk.toArray) }
-    }
+    val state = new AtomicReference[Any]()
+    val now = Task.now(())
+
+    val write = \/-({ chunk: ByteVector =>
+      try {
+        out.write(chunk.toArray)
+        if (flush) out.flush()
+        now
+      } catch {
+        case t: Throwable => Task.fail(t)
+      }
+    })
 
     if (body eq Process.halt) Task.now(())
     else {
-      val actor: Actor[Any] = Actor.actor[Any] {
-        case callback: Callback =>
-          if (error.isDefined)
-            callback(-\/(error.get))
-          else if (out.isReady)
-            callback(\/-(write))
-          else
-            blocked = Some(callback)
-
-        case WriteReady =>
-          logger.debug("Write ready")
-          blocked.foreach { _(\/-(write)) }
-          blocked = None
-
-        case t: Throwable =>
-          logger.error("Error during Servlet Async Write", t)
-          error = Some(t)
-          blocked.foreach { _(-\/(t)) }
-          blocked = None
-      }
-
-      // Initialized the listener
+            // Initialized the listener
       out.setWriteListener(new WriteListener {
-        override def onWritePossible(): Unit = actor ! WriteReady
-        override def onError(t: Throwable): Unit = actor ! t
+        override def onWritePossible(): Unit = {
+          state.getAndSet(null) match {
+            case cb: Callback => cb(write); logger.debug("Fulfilled callback")
+            case t: Throwable => sys.error("Inconsistent state")
+            case null => // NOOP
+          }
+        }
+        override def onError(t: Throwable): Unit = {
+          state.getAndSet(t) match {
+            case cb: Callback => cb(-\/(t))
+            case _ => // NOOP- don't care about Throwables or nulls
+          }
+        }
       })
 
       val sink = Process.repeatEval {
-        Task.async[ByteVector => Task[Unit]] { actor ! _ }
+        Task.fork(Task.async[ByteVector => Task[Unit]] { cb =>
+          if (state.compareAndSet(null, cb)) {
+              if (out.isReady && state.compareAndSet(cb, null)) {
+                // take back our callback and just write, if its gone, it must be taken care of
+                cb(write)
+              } else logger.debug("Servlet Async Writer waiting for ready")
+              // Otherwise, our callback must have been handled by the WriteListener
+          } else state.get match {  // must be an error state
+            case t: Throwable => cb(-\/(t))
+            case _ => sys.error("Inconsistent state")
+          }
+
+        })
       }
 
       body.to(sink).run
