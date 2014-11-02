@@ -94,12 +94,8 @@ class Http4sServlet(service: HttpService,
           servletResponse.setStatus(response.status.code, response.status.reason)
           for (header <- response.headers)
             servletResponse.addHeader(header.name.toString, header.value)
-          val out = servletResponse.getOutputStream
-          val isChunked = response.isChunked
-          response.body.map { chunk =>
-            out.write(chunk.toArray)
-            if (isChunked) servletResponse.flushBuffer()
-        }.run
+
+          outputStreamWriter(servletResponse, request.body)
 
         case None => ResponseBuilder.notFound(request)
       }
@@ -150,8 +146,11 @@ object Http4sServlet extends LazyLogging {
 
   private def asyncOutputStreamWriter(resp: HttpServletResponse, body: EntityBody): Task[Unit] = {
     type Callback = Throwable \/ Unit => Unit
-    case class BytePacket(v: ByteVector, cb: Callback)
-    case object WriteReady
+
+    sealed trait Msg
+    case class BytePacket(v: ByteVector, cb: Callback) extends Msg
+    case class Err(t: Throwable) extends Msg
+    case object WriteReady extends Msg
 
     val out = resp.getOutputStream
     var wait: BytePacket = null
@@ -159,17 +158,17 @@ object Http4sServlet extends LazyLogging {
 
     if (body eq Process.halt) Task.now(())
     else {
-      val actor: Actor[Any] = Actor.actor[Any] {
-        case c @ BytePacket(_, callback: Callback) if error != null =>
-          callback(-\/(error))
-
+      val actor: Actor[Msg] = Actor.actor[Msg] {
         case c @ BytePacket(vector: ByteVector, callback: Callback) =>
-          if (vector.length > 0) {
+          if (error != null) callback(-\/(error))
+          else if (vector.length > 0) {
+            logger.info("Writing packet.")
             if (out.isReady) out.write(vector.toArray)
             else wait = c
           } else callback(\/-(()))
 
         case WriteReady =>
+          logger.info("Write ready")
           wait match {
             case BytePacket(bv, cb) =>
               out.write(bv.toArray)
@@ -179,7 +178,7 @@ object Http4sServlet extends LazyLogging {
             case null => // noop
           }
 
-        case t: Throwable =>
+        case Err(t) =>
           logger.error("Error during Servlet Async Write", t)
           error = t
           wait match {
@@ -194,12 +193,12 @@ object Http4sServlet extends LazyLogging {
       // Initialized the listener
       out.setWriteListener(new WriteListener {
         override def onWritePossible(): Unit = actor ! WriteReady
-        override def onError(t: Throwable): Unit = actor ! t
+        override def onError(t: Throwable): Unit = actor ! Err(t)
       })
 
-      body.to(Process.constant{ bv: ByteVector =>
-        Task.async[Unit] ( cb => actor ! (bv, cb) )
-      }).run
+      body.to(Process.emit { bv: ByteVector =>
+        Task.async[Unit] { cb => logger.info("Triggering."); actor ! BytePacket(bv, cb) }
+      }.repeat).run
     }
   }
 
