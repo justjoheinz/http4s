@@ -95,7 +95,7 @@ class Http4sServlet(service: HttpService,
           for (header <- response.headers)
             servletResponse.addHeader(header.name.toString, header.value)
 
-          outputStreamWriter(servletResponse, request.body)
+          outputStreamWriter(servletResponse, response.body)
 
         case None => ResponseBuilder.notFound(request)
       }
@@ -162,14 +162,17 @@ object Http4sServlet extends LazyLogging {
         case c @ BytePacket(vector: ByteVector, callback: Callback) =>
           if (error != null) callback(-\/(error))
           else if (vector.length > 0) {
-            logger.info("Writing packet.")
-            if (out.isReady) out.write(vector.toArray)
+            logger.debug("Writing packet.")
+            if (out.isReady) {
+              out.write(vector.toArray)
+              callback(\/-(()))
+            }
             else wait = c
           } else callback(\/-(()))
 
         case WriteReady =>
-          logger.info("Write ready")
-          wait match {
+          logger.debug("Write ready")
+          if (out.isReady) wait match {
             case BytePacket(bv, cb) =>
               out.write(bv.toArray)
               cb(\/-(()))
@@ -197,7 +200,7 @@ object Http4sServlet extends LazyLogging {
       })
 
       body.to(Process.emit { bv: ByteVector =>
-        Task.async[Unit] { cb => logger.info("Triggering."); actor ! BytePacket(bv, cb) }
+        Task.async[Unit] { cb => actor ! BytePacket(bv, cb) }
       }.repeat).run
     }
   }
