@@ -148,33 +148,32 @@ object Http4sServlet extends LazyLogging {
 
   private def asyncOutputStreamWriter(resp: HttpServletResponse, body: EntityBody, flush: Boolean): Task[Unit] = {
     type Callback = Throwable \/ (ByteVector => Task[Unit]) => Unit
-    val out = resp.getOutputStream
+    case object Ready // signal the OutputStream is ready for writing
 
+    val out = resp.getOutputStream
     val state = new AtomicReference[Any]()
     val now = Task.now(())
-
     val write = \/-({ chunk: ByteVector =>
       try {
         out.write(chunk.toArray)
         if (flush) out.flush()
         now
-      } catch {
-        case t: Throwable => Task.fail(t)
-      }
+      } catch { case t: Throwable => Task.fail(t) }
     })
 
     if (body eq Process.halt) Task.now(())
-    else {
+    else { 
             // Initialized the listener
       out.setWriteListener(new WriteListener {
         override def onWritePossible(): Unit = {
-          state.getAndSet(null) match {
+          state.getAndSet(Ready) match {
             case cb: Callback => cb(write); logger.debug("Fulfilled callback")
             case t: Throwable => sys.error("Inconsistent state")
-            case null => // NOOP
+            case null => // NOOP -- initialized before the Sink
           }
         }
         override def onError(t: Throwable): Unit = {
+          logger.error("Failure during async context", t)
           state.getAndSet(t) match {
             case cb: Callback => cb(-\/(t))
             case _ => // NOOP- don't care about Throwables or nulls
@@ -184,20 +183,21 @@ object Http4sServlet extends LazyLogging {
 
       val sink = Process.repeatEval {
         Task.fork(Task.async[ByteVector => Task[Unit]] { cb =>
-          if (state.compareAndSet(null, cb)) {
-              if (out.isReady && state.compareAndSet(cb, null)) {
+          state.getAndSet(cb) match  {
+            case Ready => 
+              if (out.isReady && state.compareAndSet(cb, Ready)) {
                 // take back our callback and just write, if its gone, it must be taken care of
                 cb(write)
-              } else logger.debug("Servlet Async Writer waiting for ready")
-              // Otherwise, our callback must have been handled by the WriteListener
-          } else state.get match {  // must be an error state
+              } // otherwise, either our callback needs to be there or was taken care of
+              
+            case null => // NOOP the WriteListener is not yet set
             case t: Throwable => cb(-\/(t))
-            case _ => sys.error("Inconsistent state")
+            case _ => cb(-\/(new Exception("Inconsistent state")))
           }
 
         })
       }
-
+      
       body.to(sink).run
     }
   }
