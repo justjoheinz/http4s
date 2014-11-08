@@ -92,17 +92,15 @@ class Http4sServlet(service: HttpService,
 
   private def handle(request: Request, ctx: AsyncContext): Unit = {
     val servletResponse = ctx.getResponse.asInstanceOf[HttpServletResponse]
-    Task.fork {
-      service(request).flatMap {
-        case Some(response) =>
-          servletResponse.setStatus(response.status.code, response.status.reason)
-          for (header <- response.headers)
-            servletResponse.addHeader(header.name.toString, header.value)
+    service(request).flatMap {
+      case Some(response) =>
+        servletResponse.setStatus(response.status.code, response.status.reason)
+        for (header <- response.headers)
+          servletResponse.addHeader(header.name.toString, header.value)
 
-          outputStreamWriter(servletResponse, response.body, response.isChunked)
+        outputStreamWriter(servletResponse, response.body, response.isChunked)
 
-        case None => ResponseBuilder.notFound(request)
-      }
+      case None => ResponseBuilder.notFound(request)
     }.runAsync {
       case \/-(_) =>
         ctx.complete()
@@ -155,7 +153,7 @@ object Http4sServlet {
     case object Ready // signal the OutputStream is ready for writing
 
     val out = resp.getOutputStream
-    val state = new AtomicReference[Any](Ready)
+    val state = new AtomicReference[Any]()
     val write = \/-({ chunk: ByteVector =>
       Task.now {
         out.write(chunk.toArray)
@@ -173,7 +171,8 @@ object Http4sServlet {
           state.getAndSet(Ready) match {
             case cb: Callback => cb(write); logger.debug("Fulfilled callback")
             case t: Throwable => sys.error("Inconsistent state")
-            case Ready => // NOOP -- initialized before the Sink
+            case null => // NOOP -- initialized before the Sink
+            case Ready => logger.warn("Inconsistent state: READY")
           }
         }
         override def onError(t: Throwable): Unit = {
@@ -194,6 +193,7 @@ object Http4sServlet {
                 cb(write)
               } // otherwise, either our callback needs to be there or was taken care of
             case t: Throwable => cb(-\/(t))
+            case null => // not yet initialized. The callback should get handled by the listener
             case _ => cb(-\/(new Exception("Inconsistent state")))
           }
 
