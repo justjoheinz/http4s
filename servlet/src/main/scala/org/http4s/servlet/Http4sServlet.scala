@@ -155,7 +155,7 @@ object Http4sServlet {
     case object Ready // signal the OutputStream is ready for writing
 
     val out = resp.getOutputStream
-    val state = new AtomicReference[Any]()
+    val state = new AtomicReference[Any](Ready)
     val write = \/-({ chunk: ByteVector =>
       Task.now {
         out.write(chunk.toArray)
@@ -164,15 +164,16 @@ object Http4sServlet {
       }
     })
 
-    if (body eq Process.halt) Task.now(())
+    if (body.isHalt)
+      Task.now(())
     else { 
-            // Initialized the listener
+      // Initialized the listener
       out.setWriteListener(new WriteListener {
         override def onWritePossible(): Unit = {
           state.getAndSet(Ready) match {
             case cb: Callback => cb(write); logger.debug("Fulfilled callback")
             case t: Throwable => sys.error("Inconsistent state")
-            case null => // NOOP -- initialized before the Sink
+            case Ready => // NOOP -- initialized before the Sink
           }
         }
         override def onError(t: Throwable): Unit = {
@@ -192,8 +193,6 @@ object Http4sServlet {
                 // take back our callback and just write, if its gone, it must be taken care of
                 cb(write)
               } // otherwise, either our callback needs to be there or was taken care of
-              
-            case null => // NOOP the WriteListener is not yet set
             case t: Throwable => cb(-\/(t))
             case _ => cb(-\/(new Exception("Inconsistent state")))
           }
