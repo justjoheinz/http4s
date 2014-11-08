@@ -156,13 +156,12 @@ object Http4sServlet {
 
     val out = resp.getOutputStream
     val state = new AtomicReference[Any]()
-    val now = Task.now(())
     val write = \/-({ chunk: ByteVector =>
-      try {
+      Task.now {
         out.write(chunk.toArray)
-        if (flush) out.flush()
-        now
-      } catch { case t: Throwable => Task.fail(t) }
+        if (flush && out.isReady)
+          out.flush()
+      }
     })
 
     if (body eq Process.halt) Task.now(())
